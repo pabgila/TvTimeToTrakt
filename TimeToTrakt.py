@@ -10,7 +10,7 @@ import trakt.core
 from trakt import init
 
 from processor import TVShowProcessor, MovieProcessor
-from searcher import TVTimeTVShow, TVTimeMovie
+from searcher import TVShowSearcher, TVTimeTVShow, TVTimeMovie
 
 # Setup logger
 logging.basicConfig(
@@ -128,6 +128,31 @@ SHOW_SUPPLEMENTARY_SOURCES = [
             "episode_number": "episode_number",
         },
     },
+    {
+        "filename": "rewatched_episode.csv",
+        "column_map": {
+            "series_name": "tv_show_name",
+            "created_at": "created_at",
+            "episode_id": "episode_id",
+            "season_number": "episode_season_number",
+            "episode_number": "episode_number",
+        },
+    },
+    {
+        # This file's rows come in two shapes: per-episode watch events (key starts with
+        # "watch-episode-", with episode_id/episode_number/season_number populated) and
+        # per-series aggregate/follow rows (key starts with "user-series-", with those
+        # fields blank). The blank ones are naturally filtered out below since we require
+        # episode_number/series_name/episode_id to be non-empty.
+        "filename": "tracking-prod-records-v2.csv",
+        "column_map": {
+            "series_name": "series_name",
+            "created_at": "created_at",
+            "episode_id": "episode_id",
+            "season_number": "season_number",
+            "episode_number": "episode_number",
+        },
+    },
 ]
 
 
@@ -193,6 +218,12 @@ def collect_show_rows(directory: str) -> list[dict]:
                     continue
                 if not row.get("episode_number") or not row.get("series_name") or not row.get("episode_id"):
                     continue
+                if row["episode_number"] == "0":
+                    # TV Time uses "0" for episodes it couldn't number (seen in some anime
+                    # entries). int("0") - 1 == -1, which in Python wraps around and picks
+                    # the LAST episode of the season - silently marking the wrong episode
+                    # as seen. Skip these rather than risk a wrong import.
+                    continue
                 episodes_by_id.setdefault(row["episode_id"], {
                     "series_name": row["series_name"],
                     "created_at": row["created_at"],
@@ -212,6 +243,10 @@ def collect_show_rows(directory: str) -> list[dict]:
             for row in csv.DictReader(csvfile, delimiter=","):
                 normalized = {target: row.get(source_col, "") for target, source_col in source["column_map"].items()}
                 if not normalized["episode_number"] or not normalized["series_name"] or not normalized["episode_id"]:
+                    continue
+                if normalized["episode_number"] == "0":
+                    # See comment above: an unnumbered episode would otherwise wrongly
+                    # resolve to the last episode of the season.
                     continue
                 episodes_by_id.setdefault(normalized["episode_id"], normalized)
 
@@ -263,6 +298,8 @@ def process_watched_shows() -> None:
             next(reader, None)
             for rows_count, row in enumerate(reader):
                 if row["episode_number"] == "":  # if not an episode entry
+                    continue
+                if row["episode_number"] == "0":  # TV Time's sentinel for an unnumbered episode
                     continue
                 if row["series_name"] == "":  # if the series name is blank
                     continue
@@ -324,13 +361,86 @@ def process_watched_movies() -> None:
                 MovieProcessor(watched_list).process_item(movie, progress)
 
 
+def get_shows_pending_to_watch(directory: str) -> list[str]:
+    """
+    Returns the names of shows that are currently followed in TV Time
+    (present in 'followed_tv_show.csv') but have zero watched episodes across
+    every known source in the export - i.e. shows you want to watch but
+    haven't started yet.
+    """
+    followed_file = find_file_in_directory(directory, "followed_tv_show.csv")
+    if not followed_file:
+        logging.warning(f"Could not find 'followed_tv_show.csv' in '{directory}'.")
+        return []
+
+    with open(followed_file, newline="", encoding="UTF-8") as csvfile:
+        followed_names = [
+            row["tv_show_name"] for row in csv.DictReader(csvfile, delimiter=",")
+            if row.get("tv_show_name") and row.get("active") == "1"
+        ]
+
+    watched_names = {row["series_name"] for row in collect_show_rows(directory)}
+
+    # Preserve order, remove duplicates
+    seen = set()
+    pending = []
+    for name in followed_names:
+        if name in watched_names or name in seen:
+            continue
+        seen.add(name)
+        pending.append(name)
+
+    return pending
+
+
+def process_shows_watchlist() -> None:
+    pending_shows = get_shows_pending_to_watch(WATCHED_SHOWS_PATH)
+    if not pending_shows:
+        logging.info("No followed shows without watched episodes were found - nothing to add to the watchlist.")
+        return
+
+    logging.info(f"Found {len(pending_shows)} followed show(s) with no watched episodes: {pending_shows}")
+
+    for index, name in enumerate(pending_shows, start=1):
+        logging.info(f"({index}/{len(pending_shows)}) Searching Trakt for '{name}'...")
+
+        # TVShowSearcher/TVTimeTVShow were designed around per-episode rows, but we only
+        # need to resolve the show itself here, so we build a placeholder row - the
+        # episode/season fields are never used since we only call add_to_watchlist().
+        placeholder_row = {
+            "series_name": name,
+            "created_at": datetime.now().strftime(config.date_format),
+            "episode_id": "0",
+            "season_number": "1",
+            "episode_number": "1",
+        }
+
+        try:
+            tv_time_show = TVTimeTVShow(placeholder_row)
+            trakt_show = TVShowSearcher(tv_time_show).search(tv_time_show.title)
+        except Exception as e:
+            logging.warning(f"Could not search Trakt for '{name}': {e}")
+            continue
+
+        if trakt_show is None:
+            logging.warning(f"Skipped '{name}' (not found on Trakt, or skipped manually).")
+            continue
+
+        try:
+            trakt_show.add_to_watchlist()
+            logging.info(f"Added '{name}' to your Trakt watchlist.")
+        except Exception as e:
+            logging.warning(f"Failed to add '{name}' to your Trakt watchlist: {e}")
+
+
 def menu_selection() -> int:
     # Display a menu selection
     print(">> What do you want to do?")
     print("    1) Import Watch History for TV Shows from TV Time")
     print("    2) Import Watched Movies from TV Time")
     print("    3) Do both 1 and 2 (default)")
-    print("    4) Exit")
+    print("    4) Add followed shows with no watched episodes to your Trakt watchlist")
+    print("    5) Exit")
 
     while True:
         try:
@@ -340,11 +450,11 @@ def menu_selection() -> int:
         except ValueError:
             logging.warning("Invalid input. Please enter a numerical number.")
     # Check if the input is valid
-    if not 1 <= selection <= 4:
+    if not 1 <= selection <= 5:
         logging.warning("Sorry - that's an unknown menu selection")
         exit()
-    # Exit if the 4th option was chosen
-    if selection == 4:
+    # Exit if the last option was chosen
+    if selection == 5:
         logging.info("Exiting as per user's selection.")
         exit()
 
@@ -371,6 +481,9 @@ def start():
         logging.info("Processing both watched shows and movies.")
         process_watched_shows()
         process_watched_movies()
+    elif selection == 4:
+        logging.info("Adding followed shows with no watched episodes to your Trakt watchlist.")
+        process_shows_watchlist()
 
 
 if __name__ == "__main__":
